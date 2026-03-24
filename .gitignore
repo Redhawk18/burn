@@ -20,3 +20,5 @@ uv.lock
 # Nix direnv
 .envrc
 .direnv
+
+dhat-heap.json

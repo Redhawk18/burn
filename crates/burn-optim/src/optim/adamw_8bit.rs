@@ -1,3 +1,5 @@
+//! An 8-bit optimizer of AdamW.
+
 use burn_core as burn;
 
 use burn::config::Config;
@@ -12,15 +14,18 @@ use crate::{LearningRate, grad_clipping::GradientClippingConfig};
 #[allow(unused_imports)]
 use num_traits::Float as _;
 
-/// [`AdamW`] Configuration.
+/// [`AdamW8Bit`] Configuration.
 #[derive(Config, Debug)]
-pub struct AdamWConfig {
+pub struct AdamWConfig8Bit {
     /// Parameter for AdamW.
     #[config(default = 0.9)]
     beta_1: f32,
     /// Parameter for AdamW.
     #[config(default = 0.999)]
     beta_2: f32,
+    // /// The amount of quantization applied to the optimizer. Always use a power of 2.
+    // #[config(default = 2048)]
+    // block_size: usize,
     /// A value required for numerical stability.
     #[config(default = 1e-5)]
     epsilon: f32,
@@ -50,21 +55,21 @@ pub struct AdamWConfig {
 ///
 /// Configured by [`AdamWConfig`].
 #[derive(Clone)]
-pub struct AdamW {
-    pub momentum: AdaptiveMomentumW,
+pub struct AdamW8Bit {
+    pub momentum: AdaptiveMomentumW8Bit,
     pub weight_decay: f32,
     pub cautious_weight_decay: bool,
 }
 
 /// AdamW state.
 #[derive(Record, Clone, new)]
-pub struct AdamWState<B: Backend, const D: usize> {
+pub struct AdamWState8Bit<B: Backend, const D: usize> {
     /// Th current adaptive momentum state.
     pub momentum: AdaptiveMomentumState<B, D>,
 }
 
-impl<B: Backend> SimpleOptimizer<B> for AdamW {
-    type State<const D: usize> = AdamWState<B, D>;
+impl<B: Backend> SimpleOptimizer<B> for AdamW8Bit {
+    type State<const D: usize> = AdamWState8Bit<B, D>;
 
     /// A single optimization step for any tensor that represents the parameters of a model.
     fn step<const D: usize>(
@@ -99,7 +104,7 @@ impl<B: Backend> SimpleOptimizer<B> for AdamW {
 
         let tensor_updated = decayed_tensor - raw_delta.mul_scalar(lr);
 
-        let state = AdamWState {
+        let state = AdamWState8Bit {
             momentum: momentum_state,
         };
 
@@ -112,15 +117,17 @@ impl<B: Backend> SimpleOptimizer<B> for AdamW {
     }
 }
 
-impl AdamWConfig {
+impl AdamWConfig8Bit {
     /// Initialize AdamW optimizer.
     ///
     /// # Returns
     ///
     /// Returns an optimizer that can be used to optimize a module.
-    pub fn init<B: AutodiffBackend, M: AutodiffModule<B>>(&self) -> OptimizerAdaptor<AdamW, M, B> {
-        let optim = AdamW {
-            momentum: AdaptiveMomentumW {
+    pub fn init<B: AutodiffBackend, M: AutodiffModule<B>>(
+        &self,
+    ) -> OptimizerAdaptor<AdamW8Bit, M, B> {
+        let optim = AdamW8Bit {
+            momentum: AdaptiveMomentumW8Bit {
                 beta_1: self.beta_1,
                 beta_2: self.beta_2,
                 epsilon: self.epsilon,
@@ -139,14 +146,14 @@ impl AdamWConfig {
 }
 
 #[derive(Clone)]
-pub struct AdaptiveMomentumW {
+pub struct AdaptiveMomentumW8Bit {
     pub beta_1: f32,
     pub beta_2: f32,
     pub epsilon: f32,
     pub amsgrad: bool,
 }
 
-impl AdaptiveMomentumW {
+impl AdaptiveMomentumW8Bit {
     pub fn transform<B: Backend, const D: usize>(
         &self,
         grad: Tensor<B, D>,
@@ -233,11 +240,11 @@ mod tests {
     const LEARNING_RATE: LearningRate = 0.01;
 
     #[test]
-    fn test_adamw_optimizer_save_load_state() {
+    fn test_adamw_8bit_8bit_optimizer_save_load_state() {
         let device = Default::default();
         let linear = LinearConfig::new(6, 6).init(&device);
         let x = Tensor::<TestAutodiffBackend, 2>::random([2, 6], Distribution::Default, &device);
-        let mut optimizer = create_adamw();
+        let mut optimizer = create_adamw_8bit();
         let grads = linear.forward(x).backward();
         let grads = GradientsParams::from_grads(grads, &linear);
         let _linear = optimizer.step(LEARNING_RATE, linear, grads);
@@ -265,14 +272,14 @@ mod tests {
 
         let state_optim_before = optimizer.to_record();
         let state_optim_before_copy = optimizer.to_record();
-        let optimizer = create_adamw();
+        let optimizer = create_adamw_8bit();
         let optimizer = optimizer.load_record(state_optim_before_copy);
         let state_optim_after = optimizer.to_record();
 
         assert_eq!(state_optim_before.len(), state_optim_after.len());
     }
     #[test]
-    fn test_adamw_optimizer_with_amsgrad_50_steps() {
+    fn test_adamw_8bit_optimizer_with_amsgrad_50_steps() {
         let device = Default::default();
         let mut linear = given_linear_layer(
             TensorData::from([
@@ -286,7 +293,7 @@ mod tests {
             TensorData::from([-0.3905, 0.0884, -0.0970, 0.1176, 0.1366, 0.0130]),
         );
 
-        let mut optimizer = AdamWConfig::new()
+        let mut optimizer = AdamWConfig8Bit::new()
             .with_epsilon(1e-8)
             .with_beta_1(0.9)
             .with_beta_2(0.999)
@@ -373,7 +380,7 @@ mod tests {
         bias_updated.assert_approx_eq::<FT>(&bias_expected, tolerance);
     }
     #[test]
-    fn test_adamw_optimizer_with_numbers() {
+    fn test_adamw_8bit_optimizer_with_numbers() {
         let linear = given_linear_layer(
             TensorData::from([
                 [-0.3206, 0.1374, 0.4043, 0.3200, 0.0859, 0.0671],
@@ -403,7 +410,7 @@ mod tests {
         )
         .require_grad();
 
-        let mut optimizer = AdamWConfig::new()
+        let mut optimizer = AdamWConfig8Bit::new()
             .with_epsilon(1e-8)
             .with_beta_1(0.9)
             .with_beta_2(0.999)
@@ -450,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adamw_optimizer_with_numbers_cautious() {
+    fn test_adamw_8bit_optimizer_with_numbers_cautious() {
         let linear = given_linear_layer(
             TensorData::from([
                 [-0.3206, 0.1374, 0.4043, 0.3200, 0.0859, 0.0671],
@@ -480,7 +487,7 @@ mod tests {
         )
         .require_grad();
 
-        let mut optimizer = AdamWConfig::new()
+        let mut optimizer = AdamWConfig8Bit::new()
             .with_cautious_weight_decay(true)
             .with_epsilon(1e-8)
             .with_beta_1(0.9)
@@ -530,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adam_optimizer_no_nan() {
+    fn test_adamw_8bit_optimizer_no_nan() {
         let linear = given_linear_layer(
             TensorData::from([
                 [-0.3206, 0.1374, 0.4043, 0.3200, 0.0859, 0.0671],
@@ -552,7 +559,7 @@ mod tests {
         )
         .require_grad();
 
-        let mut optimizer = AdamWConfig::new()
+        let mut optimizer = AdamWConfig8Bit::new()
             .with_epsilon(1e-8)
             .with_beta_1(0.9)
             .with_beta_2(0.999)
@@ -581,10 +588,11 @@ mod tests {
         LinearConfig::new(6, 6).init(&device).load_record(record)
     }
 
-    fn create_adamw() -> OptimizerAdaptor<AdamW, Linear<TestAutodiffBackend>, TestAutodiffBackend> {
-        let config = AdamWConfig::new();
-        AdamW {
-            momentum: AdaptiveMomentumW {
+    fn create_adamw_8bit()
+    -> OptimizerAdaptor<AdamW8Bit, Linear<TestAutodiffBackend>, TestAutodiffBackend> {
+        let config = AdamWConfig8Bit::new();
+        AdamW8Bit {
+            momentum: AdaptiveMomentumW8Bit {
                 beta_1: config.beta_1,
                 beta_2: config.beta_2,
                 epsilon: config.epsilon,

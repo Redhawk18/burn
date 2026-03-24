@@ -96,7 +96,20 @@ burn-nn = { path = "../burn-nn", version = "=0.21.0-pre.2" }
 burn-ndarray = { path = "../burn-ndarray", version = "=0.21.0-pre.2" }
 burn-autodiff = { path = "../burn-autodiff", version = "=0.21.0-pre.2" }
 rstest = { workspace = true }
+burn = { path = "../burn", version = "=0.21.0-pre.2", features = ["ndarray"] }
+dhat = "0.3.3"
+
 
 [package.metadata.docs.rs]
 features = ["doc"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "adamw"
+path = "benches/adamw.rs"
+harness = false
+
+[[bench]]
+name = "adamw_8bit"
+path = "benches/adamw_8bit.rs"
+harness = false
