@@ -1,6 +1,7 @@
 //! An 8-bit optimizer of AdamW.
 
 use burn_core as burn;
+use burn_core::tensor::DType;
 
 use burn::config::Config;
 use burn::tensor::{Int, Shape};
@@ -233,62 +234,6 @@ impl<B: Backend, const D: usize> QuantizeBlockwise<B, D> {
     }
 }
 
-// fn quantize_blockwise<B: Backend, const D: usize>(
-//     tensor: Tensor<B, D>,
-//     block_size: usize,
-// ) -> QuantizeBlockwise<B, D> {
-//     let shape = tensor.shape();
-//     let _dims: [_; D] = shape.dims();
-//     let total_elements = shape.num_elements();
-
-//     let padding = (block_size - (total_elements % block_size)) % block_size;
-//     let padded_total = total_elements + padding;
-//     let num_blocks = padded_total / block_size;
-
-//     let flattened = tensor.reshape([total_elements]);
-//     let input = if padding > 0 {
-//         let device = flattened.device();
-//         let pad_tensor = Tensor::<B, 1>::zeros([padding], &device);
-//         Tensor::cat(vec![flattened, pad_tensor], 0)
-//     } else {
-//         flattened
-//     };
-
-//     // Before.
-//     // index:  0   1   2   3   4   5   6   7   8   9  10  11
-//     // value:  a0  a1  a2  a3  a4  a5  a6  a7  a8  a9 a10 a11
-//     //
-//     // After.
-//     // block 0: [ a0, a1, a2, a3 ]
-//     // block 1: [ a4, a5, a6, a7 ]
-//     // block 2: [ a8, a9, a10, a11 ]
-//     let blocked = input.reshape([num_blocks, block_size]);
-
-//     // 2D -> 1D list of scales.
-//     let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
-//     // Compute scales, max absolute value per block / 127.
-//     let scales = abs_max / 127.0; // or .div(127.0)
-//     let mask = scales.clone().equal_elem(0.0);
-//     let scales = scales.mask_fill(mask, 1.0); // Avoid division by zero.
-
-//     let scales_expanded = scales
-//         .clone()
-//         .reshape([num_blocks, 1])
-//         .expand([num_blocks, block_size]);
-
-//     let quantized = blocked
-//         .div(scales_expanded)
-//         .round()
-//         .int()
-//         .reshape([padded_total]);
-
-//     QuantizeBlockwise {
-//         quantized,
-//         scales,
-//         shape: shape.dims(),
-//     }
-// }
-
 fn quantize_blockwise<B: Backend, const D: usize>(
     tensor: Tensor<B, D>,
     block_size: usize,
@@ -357,38 +302,6 @@ fn quantize_blockwise<B: Backend, const D: usize>(
     }
 }
 
-// /// Dequantizes a block‑wise quantized tensor back to its original shape.
-// fn dequantize_blockwise<B: Backend, const D: usize>(
-//     quantized_blockwise: QuantizeBlockwise<B, D>,
-//     block_size: usize,
-// ) -> Tensor<B, D> {
-//     let shape = Shape::from(quantized_blockwise.shape.clone());
-//     let total_elements = shape.num_elements();
-//     let padded_total = quantized_blockwise.quantized.shape().num_elements(); // should be a multiple of block_size
-//     let num_blocks = padded_total / block_size;
-
-//     // Reshape quantized data into blocks
-//     let quantized_blocked = quantized_blockwise
-//         .quantized
-//         .reshape([num_blocks, block_size]);
-
-//     // Expand scales to match block shape
-//     let scales_expanded = quantized_blockwise
-//         .scales
-//         .reshape([num_blocks, 1])
-//         .expand([num_blocks, block_size]);
-
-//     // Dequantize: convert to float and multiply by scales
-//     let dequantized = quantized_blocked.float().mul(scales_expanded);
-
-//     // Flatten and remove padding
-//     let dequantized_flat = dequantized.reshape([padded_total]);
-//     let dequantized_unpadded = dequantized_flat.slice([0..total_elements]);
-
-//     // Restore original shape
-//     dequantized_unpadded.reshape(quantized_blockwise.shape)
-// }
-
 fn dequantize_blockwise<B: Backend, const D: usize>(
     quantized_blockwise: QuantizeBlockwise<B, D>,
     block_size: usize,
@@ -412,9 +325,12 @@ fn dequantize_blockwise<B: Backend, const D: usize>(
 
     // 2. Reconstruct the flattened unsigned tensor
     // We use stack to join them back into the original order
-    let unpacked = Tensor::stack::<D>(vec![v0, v1, v2, v3], 1)
+    // let unpacked = Tensor::stack::<D>(vec![v0, v1, v2, v3], 1)
+    //     .reshape([padded_total])
+    //     .sub_scalar(128); // Shift back to [-127, 127]
+    let unpacked = Tensor::stack::<2>(vec![v0, v1, v2, v3], 1) // Force rank 2
         .reshape([padded_total])
-        .sub_scalar(128); // Shift back to [-127, 127]
+        .sub_scalar(128);
 
     // 3. Dequantize normally
     let num_blocks = padded_total / block_size;
@@ -831,7 +747,7 @@ mod tests {
             let quantize = quantize_blockwise(tensor.clone(), block_size);
 
             // Verify internal dimensions
-            assert_eq!(quantize.quantized.shape().num_elements(), 256);
+            assert_eq!(quantize.quantized.shape().num_elements(), 256 / 4); // Packed by 4s.
             assert_eq!(quantize.scales.shape().num_elements(), 2);
 
             let dequantized: Tensor<TestBackend, 1> = dequantize_blockwise(quantize, block_size);
@@ -893,7 +809,7 @@ mod tests {
 
             let quantize = quantize_blockwise(tensor.clone(), block_size);
 
-            assert_eq!(quantize.quantized.shape().num_elements(), 128);
+            assert_eq!(quantize.quantized.shape().num_elements(), 128 / 4); // Packed by 4s.
             assert_eq!(quantize.scales.shape().num_elements(), 2);
 
             let dequantized: Tensor<TestBackend, 1> = dequantize_blockwise(quantize, block_size);
@@ -909,7 +825,7 @@ mod tests {
 
             let quantize = quantize_blockwise(tensor.clone(), block_size);
 
-            assert_eq!(quantize.quantized.shape().num_elements(), 128);
+            assert_eq!(quantize.quantized.shape().num_elements(), 128 / 4); // Packed by 4s
             assert_eq!(quantize.scales.shape().num_elements(), 4);
 
             let dequantized: Tensor<TestBackend, 2> = dequantize_blockwise(quantize, block_size);
