@@ -1,9 +1,9 @@
 //! An 8-bit optimizer of AdamW.
 
 use burn_core as burn;
-use burn_core::tensor::{Int, Shape};
 
 use burn::config::Config;
+use burn::tensor::{Int, Shape};
 use burn::tensor::{Tensor, backend::AutodiffBackend};
 use burn::tensor::{backend::Backend, ops::Device};
 use burn::{module::AutodiffModule, record::Record};
@@ -24,7 +24,8 @@ pub struct AdamWConfig8Bit {
     /// Parameter for AdamW.
     #[config(default = 0.999)]
     beta_2: f32,
-    /// The amount of quantization applied to the optimizer. Always use a power of 2.
+    /// The amount of quantization applied to the optimizer. Always use a power of 2, or have
+    /// highly degraded performance.
     #[config(default = 2048)]
     block_size: usize,
     /// A value required for numerical stability.
@@ -63,57 +64,55 @@ pub struct AdamW8Bit {
 }
 
 /// AdamW state.
-#[derive(Record, Clone, new)]
+#[derive(Record, Clone)]
 pub struct AdamWState8Bit<B: Backend, const D: usize> {
-    /// Th current adaptive momentum state.
-    pub momentum: AdaptiveMomentumState<B, D>,
+    pub time: usize,
+    pub moment_1: QuantizeBlockwise<B, D>,
+    pub moment_2: QuantizeBlockwise<B, D>,
+    pub max_moment_2: Option<QuantizeBlockwise<B, D>>,
 }
 
 impl<B: Backend> SimpleOptimizer<B> for AdamW8Bit {
     type State<const D: usize> = AdamWState8Bit<B, D>;
 
-    // /// A single optimization step for any tensor that represents the parameters of a model.
+    /// A single optimization step for any tensor that represents the parameters of a model.
     fn step<const D: usize>(
         &self,
-        // Learning rate.
         lr: LearningRate,
-        // Any tensor that represents the parameters of a model.
         tensor: Tensor<B, D>,
-        // Gradient of the loss w.r.t. the parameters.
         grad: Tensor<B, D>,
-        // State of the optimizer.
         state: Option<Self::State<D>>,
     ) -> (Tensor<B, D>, Option<Self::State<D>>) {
-        let (raw_delta, momentum_state) = self.momentum.transform(grad, state.map(|s| s.momentum));
+        // 1. Get the update delta, the new quantized state, and the dequantized m1
+        let (raw_delta, new_state, m1) = self.momentum.transform(grad, state);
 
         let decay_rate = lr * (self.weight_decay as f64);
 
         let decayed_tensor = if decay_rate == 0.0 {
             tensor.clone()
         } else if self.cautious_weight_decay {
-            // Cautious weight decay.
-            // See: https://arxiv.org/abs/2510.12402
+            // C-Adam / Cautious weight decay logic
             let tensor_pos = tensor.clone().greater_equal_elem(0.0);
-            let grad_pos = momentum_state.moment_1.clone().greater_equal_elem(0.0);
+
+            // Use the dequantized m1 we just got from transform
+            let grad_pos = m1.greater_equal_elem(0.0);
             let differ = tensor_pos.not_equal(grad_pos);
 
-            // Zero out the decay where the decay is counter to the update direction.
-            tensor.clone() - tensor.mul_scalar(decay_rate).mask_fill(differ, 0.0)
+            // Apply decay only where it doesn't counter the update direction
+            let decay = tensor.clone().mul_scalar(decay_rate).mask_fill(differ, 0.0);
+            tensor.clone() - decay
         } else {
             tensor.clone().mul_scalar(1.0 - decay_rate)
         };
 
         let tensor_updated = decayed_tensor - raw_delta.mul_scalar(lr);
 
-        let state = AdamWState8Bit {
-            momentum: momentum_state,
-        };
-
-        (tensor_updated, Some(state))
+        (tensor_updated, Some(new_state))
     }
 
     fn to_device<const D: usize>(mut state: Self::State<D>, device: &Device<B>) -> Self::State<D> {
-        state.momentum = state.momentum.to_device(device);
+        state.moment_1 = state.moment_1.to_device(device);
+        state.moment_2 = state.moment_2.to_device(device);
         state
     }
 }
@@ -133,6 +132,7 @@ impl AdamWConfig8Bit {
                 beta_2: self.beta_2,
                 epsilon: self.epsilon,
                 amsgrad: self.amsgrad,
+                block_size: self.block_size,
             },
             weight_decay: self.weight_decay,
             cautious_weight_decay: self.cautious_weight_decay,
@@ -152,92 +152,93 @@ pub struct AdaptiveMomentumW8Bit {
     pub beta_2: f32,
     pub epsilon: f32,
     pub amsgrad: bool,
+    pub block_size: usize,
 }
 
 impl AdaptiveMomentumW8Bit {
     pub fn transform<B: Backend, const D: usize>(
         &self,
         grad: Tensor<B, D>,
-        state: Option<AdaptiveMomentumState<B, D>>,
-    ) -> (Tensor<B, D>, AdaptiveMomentumState<B, D>) {
+        state: Option<AdamWState8Bit<B, D>>, // Using 8-bit state
+    ) -> (Tensor<B, D>, AdamWState8Bit<B, D>, Tensor<B, D>) {
         let factor_1 = 1.0 - self.beta_1;
         let factor_2 = 1.0 - self.beta_2;
 
-        let state = if let Some(mut state) = state {
-            // Update first moment estimate.
-            state.moment_1 = state
-                .moment_1
-                .mul_scalar(self.beta_1)
-                .add(grad.clone().mul_scalar(factor_1));
-
-            // Update second moment estimate.
-            state.moment_2 = state
-                .moment_2
-                .mul_scalar(self.beta_2)
-                .add(grad.square().mul_scalar(factor_2));
-
-            if self.amsgrad {
-                let max_v = state
-                    .max_moment_2
-                    .take()
-                    .unwrap_or_else(|| state.moment_2.clone());
-                state.max_moment_2 = Some(max_v.max_pair(state.moment_2.clone()));
-            }
-
-            // Update time.
-            state.time += 1;
-
-            state
+        let (mut m1, mut m2, mut max_v, mut time) = if let Some(s) = state {
+            (
+                dequantize_blockwise::<B, D>(s.moment_1, self.block_size),
+                dequantize_blockwise::<B, D>(s.moment_2, self.block_size),
+                s.max_moment_2
+                    .map(|m| dequantize_blockwise::<B, D>(m, self.block_size)),
+                s.time + 1,
+            )
         } else {
-            // Initialize first moment estimate.
-            let moment_1 = grad.clone().mul_scalar(factor_1);
-
-            // Initialize second moment estimate.
-            let moment_2 = grad.square().mul_scalar(factor_2);
-            let max_moment_2 = self.amsgrad.then(|| moment_2.clone());
-            AdaptiveMomentumState {
-                time: 1,
-                moment_1,
-                moment_2,
-                max_moment_2,
-            }
+            (
+                Tensor::zeros(grad.shape(), &grad.device()),
+                Tensor::zeros(grad.shape(), &grad.device()),
+                None,
+                1,
+            )
         };
 
-        let time: i32 = state.time as i32;
-
-        // Compute bias-corrected first and second moment estimates.
-        let moment_1_corrected = state
-            .moment_1
-            .clone()
-            .div_scalar(1f32 - self.beta_1.powi(time));
+        // --- Standard AdamW Logic in Full Precision ---
+        m1 = m1
+            .mul_scalar(self.beta_1)
+            .add(grad.clone().mul_scalar(factor_1));
+        m2 = m2
+            .mul_scalar(self.beta_2)
+            .add(grad.square().mul_scalar(factor_2));
 
         let v_to_use = if self.amsgrad {
-            state.max_moment_2.as_ref().unwrap_or(&state.moment_2)
+            let current_max = max_v.unwrap_or_else(|| m2.clone());
+            let new_max = current_max.max_pair(m2.clone());
+            max_v = Some(new_max.clone());
+            new_max
         } else {
-            &state.moment_2
+            m2.clone()
         };
 
-        let moment_2_corrected = v_to_use.clone().div_scalar(1f32 - self.beta_2.powi(time));
+        // Compute update delta
+        let m1_corrected = m1.clone().div_scalar(1f32 - self.beta_1.powi(time as i32));
+        let m2_corrected = v_to_use.div_scalar(1f32 - self.beta_2.powi(time as i32));
+        let update_delta = m1_corrected.div(m2_corrected.sqrt().add_scalar(self.epsilon));
 
-        let update_delta =
-            moment_1_corrected.div(moment_2_corrected.sqrt().add_scalar(self.epsilon));
+        // --- Re-quantize for Storage ---
+        let state_8bit = AdamWState8Bit {
+            time,
+            moment_1: quantize_blockwise(m1.clone(), self.block_size),
+            moment_2: quantize_blockwise(m2, self.block_size),
+            max_moment_2: max_v.map(|m| quantize_blockwise(m, self.block_size)),
+        };
 
-        (update_delta, state)
+        (update_delta, state_8bit, m1)
     }
 }
 
 /// Holds required quantized blockwise infomation.
-struct QuantizeBlockwise<B: Backend> {
+#[derive(Record, Clone)]
+struct QuantizeBlockwise<B: Backend, const D: usize> {
     pub quantized: Tensor<B, 1, Int>,
     pub scales: Tensor<B, 1>,
-    pub shape: Shape,
+    pub shape: [usize; D],
+}
+
+impl<B: Backend, const D: usize> QuantizeBlockwise<B, D> {
+    pub fn to_device(self, device: &B::Device) -> Self {
+        Self {
+            quantized: self.quantized.to_device(device),
+            scales: self.scales.to_device(device),
+            shape: self.shape, // Arrays are already on the stack/copyable
+        }
+    }
 }
 
 fn quantize_blockwise<B: Backend, const D: usize>(
     tensor: Tensor<B, D>,
     block_size: usize,
-) -> QuantizeBlockwise<B> {
+) -> QuantizeBlockwise<B, D> {
     let shape = tensor.shape();
+    let _dims: [_; D] = shape.dims();
     let total_elements = shape.num_elements();
 
     let padding = (block_size - (total_elements % block_size)) % block_size;
@@ -263,8 +264,9 @@ fn quantize_blockwise<B: Backend, const D: usize>(
     // block 2: [ a8, a9, a10, a11 ]
     let blocked = input.reshape([num_blocks, block_size]);
 
+    // 2D -> 1D list of scales.
+    let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
     // Compute scales, max absolute value per block / 127.
-    let abs_max = blocked.clone().abs().max_dim(1).squeeze();
     let scales = abs_max / 127.0; // or .div(127.0)
     let mask = scales.clone().equal_elem(0.0);
     let scales = scales.mask_fill(mask, 1.0); // Avoid division by zero.
@@ -283,16 +285,17 @@ fn quantize_blockwise<B: Backend, const D: usize>(
     QuantizeBlockwise {
         quantized,
         scales,
-        shape,
+        shape: shape.dims(),
     }
 }
 
 /// Dequantizes a block‑wise quantized tensor back to its original shape.
 fn dequantize_blockwise<B: Backend, const D: usize>(
-    quantized_blockwise: QuantizeBlockwise<B>,
+    quantized_blockwise: QuantizeBlockwise<B, D>,
     block_size: usize,
 ) -> Tensor<B, D> {
-    let total_elements = quantized_blockwise.shape.num_elements();
+    let shape = Shape::from(quantized_blockwise.shape.clone());
+    let total_elements = shape.num_elements();
     let padded_total = quantized_blockwise.quantized.shape().num_elements(); // should be a multiple of block_size
     let num_blocks = padded_total / block_size;
 
@@ -691,6 +694,7 @@ mod tests {
                 beta_2: config.beta_2,
                 epsilon: config.epsilon,
                 amsgrad: config.amsgrad,
+                block_size: config.block_size,
             },
             weight_decay: config.weight_decay,
             cautious_weight_decay: false,
