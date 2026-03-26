@@ -233,92 +233,204 @@ impl<B: Backend, const D: usize> QuantizeBlockwise<B, D> {
     }
 }
 
+// fn quantize_blockwise<B: Backend, const D: usize>(
+//     tensor: Tensor<B, D>,
+//     block_size: usize,
+// ) -> QuantizeBlockwise<B, D> {
+//     let shape = tensor.shape();
+//     let _dims: [_; D] = shape.dims();
+//     let total_elements = shape.num_elements();
+
+//     let padding = (block_size - (total_elements % block_size)) % block_size;
+//     let padded_total = total_elements + padding;
+//     let num_blocks = padded_total / block_size;
+
+//     let flattened = tensor.reshape([total_elements]);
+//     let input = if padding > 0 {
+//         let device = flattened.device();
+//         let pad_tensor = Tensor::<B, 1>::zeros([padding], &device);
+//         Tensor::cat(vec![flattened, pad_tensor], 0)
+//     } else {
+//         flattened
+//     };
+
+//     // Before.
+//     // index:  0   1   2   3   4   5   6   7   8   9  10  11
+//     // value:  a0  a1  a2  a3  a4  a5  a6  a7  a8  a9 a10 a11
+//     //
+//     // After.
+//     // block 0: [ a0, a1, a2, a3 ]
+//     // block 1: [ a4, a5, a6, a7 ]
+//     // block 2: [ a8, a9, a10, a11 ]
+//     let blocked = input.reshape([num_blocks, block_size]);
+
+//     // 2D -> 1D list of scales.
+//     let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
+//     // Compute scales, max absolute value per block / 127.
+//     let scales = abs_max / 127.0; // or .div(127.0)
+//     let mask = scales.clone().equal_elem(0.0);
+//     let scales = scales.mask_fill(mask, 1.0); // Avoid division by zero.
+
+//     let scales_expanded = scales
+//         .clone()
+//         .reshape([num_blocks, 1])
+//         .expand([num_blocks, block_size]);
+
+//     let quantized = blocked
+//         .div(scales_expanded)
+//         .round()
+//         .int()
+//         .reshape([padded_total]);
+
+//     QuantizeBlockwise {
+//         quantized,
+//         scales,
+//         shape: shape.dims(),
+//     }
+// }
+
 fn quantize_blockwise<B: Backend, const D: usize>(
     tensor: Tensor<B, D>,
     block_size: usize,
 ) -> QuantizeBlockwise<B, D> {
     let shape = tensor.shape();
-    let _dims: [_; D] = shape.dims();
     let total_elements = shape.num_elements();
 
+    // Ensure padding accounts for both block_size and the 4-value packing
     let padding = (block_size - (total_elements % block_size)) % block_size;
     let padded_total = total_elements + padding;
     let num_blocks = padded_total / block_size;
 
     let flattened = tensor.reshape([total_elements]);
     let input = if padding > 0 {
-        let device = flattened.device();
-        let pad_tensor = Tensor::<B, 1>::zeros([padding], &device);
+        let pad_tensor = Tensor::<B, 1>::zeros([padding], &flattened.device());
         Tensor::cat(vec![flattened, pad_tensor], 0)
     } else {
         flattened
     };
 
-    // Before.
-    // index:  0   1   2   3   4   5   6   7   8   9  10  11
-    // value:  a0  a1  a2  a3  a4  a5  a6  a7  a8  a9 a10 a11
-    //
-    // After.
-    // block 0: [ a0, a1, a2, a3 ]
-    // block 1: [ a4, a5, a6, a7 ]
-    // block 2: [ a8, a9, a10, a11 ]
     let blocked = input.reshape([num_blocks, block_size]);
-
-    // 2D -> 1D list of scales.
     let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
-    // Compute scales, max absolute value per block / 127.
-    let scales = abs_max / 127.0; // or .div(127.0)
+    let scales = abs_max.div_scalar(127.0);
     let mask = scales.clone().equal_elem(0.0);
-    let scales = scales.mask_fill(mask, 1.0); // Avoid division by zero.
+    let scales = scales.mask_fill(mask, 1.0);
 
     let scales_expanded = scales
         .clone()
         .reshape([num_blocks, 1])
         .expand([num_blocks, block_size]);
 
-    let quantized = blocked
-        .div(scales_expanded)
-        .round()
-        .int()
-        .reshape([padded_total]);
+    // 1. Quantize to range [-127, 127]
+    // 2. Add 128 to shift to unsigned range [1, 255]
+    let quantized_unsigned = blocked.div(scales_expanded).round().int().add_scalar(128);
+
+    let flattened_unsigned = quantized_unsigned.reshape([padded_total]);
+
+    // 3. Pack 4 values into 1 i32
+    // Packed = (a * 2^24) + (b * 2^16) + (c * 2^8) + d
+    let packed_size = padded_total / 4;
+    let to_pack = flattened_unsigned.reshape([packed_size, 4]);
+
+    let v0 = to_pack
+        .clone()
+        .slice([0..packed_size, 0..1])
+        .squeeze_dims(&[1])
+        .mul_scalar(16777216);
+    let v1 = to_pack
+        .clone()
+        .slice([0..packed_size, 1..2])
+        .squeeze_dims(&[1])
+        .mul_scalar(65536);
+    let v2 = to_pack
+        .clone()
+        .slice([0..packed_size, 2..3])
+        .squeeze_dims(&[1])
+        .mul_scalar(256);
+    let v3 = to_pack.slice([0..packed_size, 3..4]).squeeze_dims(&[1]);
+
+    let packed = v0.add(v1).add(v2).add(v3);
 
     QuantizeBlockwise {
-        quantized,
+        quantized: packed,
         scales,
         shape: shape.dims(),
     }
 }
 
-/// Dequantizes a block‑wise quantized tensor back to its original shape.
+// /// Dequantizes a block‑wise quantized tensor back to its original shape.
+// fn dequantize_blockwise<B: Backend, const D: usize>(
+//     quantized_blockwise: QuantizeBlockwise<B, D>,
+//     block_size: usize,
+// ) -> Tensor<B, D> {
+//     let shape = Shape::from(quantized_blockwise.shape.clone());
+//     let total_elements = shape.num_elements();
+//     let padded_total = quantized_blockwise.quantized.shape().num_elements(); // should be a multiple of block_size
+//     let num_blocks = padded_total / block_size;
+
+//     // Reshape quantized data into blocks
+//     let quantized_blocked = quantized_blockwise
+//         .quantized
+//         .reshape([num_blocks, block_size]);
+
+//     // Expand scales to match block shape
+//     let scales_expanded = quantized_blockwise
+//         .scales
+//         .reshape([num_blocks, 1])
+//         .expand([num_blocks, block_size]);
+
+//     // Dequantize: convert to float and multiply by scales
+//     let dequantized = quantized_blocked.float().mul(scales_expanded);
+
+//     // Flatten and remove padding
+//     let dequantized_flat = dequantized.reshape([padded_total]);
+//     let dequantized_unpadded = dequantized_flat.slice([0..total_elements]);
+
+//     // Restore original shape
+//     dequantized_unpadded.reshape(quantized_blockwise.shape)
+// }
+
 fn dequantize_blockwise<B: Backend, const D: usize>(
     quantized_blockwise: QuantizeBlockwise<B, D>,
     block_size: usize,
 ) -> Tensor<B, D> {
-    let shape = Shape::from(quantized_blockwise.shape.clone());
+    let shape = Shape::from(quantized_blockwise.shape);
     let total_elements = shape.num_elements();
-    let padded_total = quantized_blockwise.quantized.shape().num_elements(); // should be a multiple of block_size
+    let packed_total = quantized_blockwise.quantized.shape().num_elements();
+    let padded_total = packed_total * 4;
+
+    // 1. Unpack the i32 back into 4 separate values
+    let packed = quantized_blockwise.quantized;
+
+    let v0 = packed.clone().div_scalar(16777216);
+    let rest1 = packed.sub(v0.clone().mul_scalar(16777216));
+
+    let v1 = rest1.clone().div_scalar(65536);
+    let rest2 = rest1.sub(v1.clone().mul_scalar(65536));
+
+    let v2 = rest2.clone().div_scalar(256);
+    let v3 = rest2.sub(v2.clone().mul_scalar(256));
+
+    // 2. Reconstruct the flattened unsigned tensor
+    // We use stack to join them back into the original order
+    let unpacked = Tensor::stack::<D>(vec![v0, v1, v2, v3], 1)
+        .reshape([padded_total])
+        .sub_scalar(128); // Shift back to [-127, 127]
+
+    // 3. Dequantize normally
     let num_blocks = padded_total / block_size;
+    let quantized_blocked = unpacked.reshape([num_blocks, block_size]);
 
-    // Reshape quantized data into blocks
-    let quantized_blocked = quantized_blockwise
-        .quantized
-        .reshape([num_blocks, block_size]);
-
-    // Expand scales to match block shape
     let scales_expanded = quantized_blockwise
         .scales
         .reshape([num_blocks, 1])
         .expand([num_blocks, block_size]);
 
-    // Dequantize: convert to float and multiply by scales
     let dequantized = quantized_blocked.float().mul(scales_expanded);
 
-    // Flatten and remove padding
-    let dequantized_flat = dequantized.reshape([padded_total]);
-    let dequantized_unpadded = dequantized_flat.slice([0..total_elements]);
-
-    // Restore original shape
-    dequantized_unpadded.reshape(quantized_blockwise.shape)
+    dequantized
+        .reshape([padded_total])
+        .slice([0..total_elements])
+        .reshape(shape)
 }
 
 #[cfg(test)]

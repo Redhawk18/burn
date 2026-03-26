@@ -1,9 +1,8 @@
-use burn::{
-    backend::NdArray,
+use burn_core::{
     prelude::Backend as _,
     tensor::{Distribution, Tensor},
 };
-use burn_ndarray::NdArrayDevice;
+use burn_ndarray::{NdArray, NdArrayDevice};
 use burn_optim::{AdamW, AdaptiveMomentumW, SimpleOptimizer};
 use std::hint::black_box;
 

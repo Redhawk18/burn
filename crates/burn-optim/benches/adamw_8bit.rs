@@ -1,9 +1,8 @@
-use burn::{
-    backend::NdArray,
+use burn_core::{
     prelude::Backend as _,
     tensor::{Distribution, Tensor},
 };
-use burn_ndarray::NdArrayDevice;
+use burn_ndarray::{NdArray, NdArrayDevice};
 use burn_optim::{AdamW8Bit, AdaptiveMomentumW8Bit, SimpleOptimizer};
 use std::hint::black_box;
 
@@ -28,6 +27,7 @@ fn main() {
         beta_2: 0.999,
         epsilon: 1e-8,
         amsgrad: false,
+        block_size: 2048,
     };
 
     let optim_std = AdamW8Bit {
