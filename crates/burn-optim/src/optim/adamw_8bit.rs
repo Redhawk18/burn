@@ -27,10 +27,10 @@ pub struct AdamWConfig8Bit {
     beta_2: f32,
     /// The amount of quantization applied to the optimizer. Always use a power of 2, or have
     /// highly degraded performance.
-    #[config(default = 2048)]
+    #[config(default = 256)]
     block_size: usize,
     /// A value required for numerical stability.
-    #[config(default = 1e-5)]
+    #[config(default = 1e-3)]
     epsilon: f32,
     /// Weight decay config.
     #[config(default = 1e-4)]
@@ -234,70 +234,85 @@ impl<B: Backend, const D: usize> QuantizeBlockwise<B, D> {
     }
 }
 
+const CHUNK_BLOCKS: usize = 1024;
+
 fn quantize_blockwise<B: Backend, const D: usize>(
     tensor: Tensor<B, D>,
     block_size: usize,
 ) -> QuantizeBlockwise<B, D> {
+    let device = tensor.device();
     let shape = tensor.shape();
     let total_elements = shape.num_elements();
 
-    // Ensure padding accounts for both block_size and the 4-value packing
     let padding = (block_size - (total_elements % block_size)) % block_size;
     let padded_total = total_elements + padding;
     let num_blocks = padded_total / block_size;
 
     let flattened = tensor.reshape([total_elements]);
     let input = if padding > 0 {
-        let pad_tensor = Tensor::<B, 1>::zeros([padding], &flattened.device());
+        let pad_tensor = Tensor::<B, 1>::zeros([padding], &device);
         Tensor::cat(vec![flattened, pad_tensor], 0)
     } else {
         flattened
     };
 
-    let blocked = input.reshape([num_blocks, block_size]);
-    let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
-    let scales = abs_max.div_scalar(127.0);
-    let mask = scales.clone().equal_elem(0.0);
-    let scales = scales.mask_fill(mask, 1.0);
+    let mut packed_chunks = Vec::new();
+    let mut scale_chunks = Vec::new();
 
-    let scales_expanded = scales
-        .clone()
-        .reshape([num_blocks, 1])
-        .expand([num_blocks, block_size]);
+    // Loop through blocks in chunks
+    for start_block in (0..num_blocks).step_by(CHUNK_BLOCKS) {
+        let end_block = core::cmp::min(start_block + CHUNK_BLOCKS, num_blocks);
+        let current_chunk_blocks = end_block - start_block;
+        let elements_in_chunk = current_chunk_blocks * block_size;
 
-    // 1. Quantize to range [-127, 127]
-    // 2. Add 128 to shift to unsigned range [1, 255]
-    let quantized_unsigned = blocked.div(scales_expanded).round().int().add_scalar(128);
+        // Slice the input for this chunk
+        let chunk_input = input
+            .clone()
+            .slice([start_block * block_size..end_block * block_size]);
+        let blocked = chunk_input.reshape([current_chunk_blocks, block_size]);
 
-    let flattened_unsigned = quantized_unsigned.reshape([padded_total]);
+        // Calculate scales for this chunk
+        let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
+        let chunk_scales = abs_max
+            .clone()
+            .div_scalar(127.0)
+            .mask_fill(abs_max.clone().equal_elem(0.0), 1.0);
 
-    // 3. Pack 4 values into 1 i32
-    // Packed = (a * 2^24) + (b * 2^16) + (c * 2^8) + d
-    let packed_size = padded_total / 4;
-    let to_pack = flattened_unsigned.reshape([packed_size, 4]);
+        let scales_expanded = chunk_scales
+            .clone()
+            .reshape([current_chunk_blocks, 1])
+            .expand([current_chunk_blocks, block_size]);
 
-    let v0 = to_pack
-        .clone()
-        .slice([0..packed_size, 0..1])
-        .squeeze_dims(&[1])
-        .mul_scalar(16777216);
-    let v1 = to_pack
-        .clone()
-        .slice([0..packed_size, 1..2])
-        .squeeze_dims(&[1])
-        .mul_scalar(65536);
-    let v2 = to_pack
-        .clone()
-        .slice([0..packed_size, 2..3])
-        .squeeze_dims(&[1])
-        .mul_scalar(256);
-    let v3 = to_pack.slice([0..packed_size, 3..4]).squeeze_dims(&[1]);
+        // Quantize and Pack
+        let quantized = blocked.div(scales_expanded).round().int().add_scalar(128);
+        let to_pack = quantized.reshape([elements_in_chunk / 4, 4]);
 
-    let packed = v0.add(v1).add(v2).add(v3);
+        let v0 = to_pack
+            .clone()
+            .slice([0..elements_in_chunk / 4, 0..1])
+            .squeeze_dims(&[1])
+            .mul_scalar(16777216);
+        let v1 = to_pack
+            .clone()
+            .slice([0..elements_in_chunk / 4, 1..2])
+            .squeeze_dims(&[1])
+            .mul_scalar(65536);
+        let v2 = to_pack
+            .clone()
+            .slice([0..elements_in_chunk / 4, 2..3])
+            .squeeze_dims(&[1])
+            .mul_scalar(256);
+        let v3 = to_pack
+            .slice([0..elements_in_chunk / 4, 3..4])
+            .squeeze_dims(&[1]);
+
+        packed_chunks.push(v0.add(v1).add(v2).add(v3));
+        scale_chunks.push(chunk_scales);
+    }
 
     QuantizeBlockwise {
-        quantized: packed,
-        scales,
+        quantized: Tensor::cat(packed_chunks, 0),
+        scales: Tensor::cat(scale_chunks, 0),
         shape: shape.dims(),
     }
 }
@@ -308,43 +323,47 @@ fn dequantize_blockwise<B: Backend, const D: usize>(
 ) -> Tensor<B, D> {
     let shape = Shape::from(quantized_blockwise.shape);
     let total_elements = shape.num_elements();
-    let packed_total = quantized_blockwise.quantized.shape().num_elements();
-    let padded_total = packed_total * 4;
+    let num_blocks = quantized_blockwise.scales.shape().num_elements();
+    let packed_per_block = block_size / 4;
 
-    // 1. Unpack the i32 back into 4 separate values
-    let packed = quantized_blockwise.quantized;
+    let mut dequantized_chunks = Vec::new();
 
-    let v0 = packed.clone().div_scalar(16777216);
-    let rest1 = packed.sub(v0.clone().mul_scalar(16777216));
+    for start_block in (0..num_blocks).step_by(CHUNK_BLOCKS) {
+        let end_block = core::cmp::min(start_block + CHUNK_BLOCKS, num_blocks);
+        let current_chunk_blocks = end_block - start_block;
 
-    let v1 = rest1.clone().div_scalar(65536);
-    let rest2 = rest1.sub(v1.clone().mul_scalar(65536));
+        // Slice packed data and scales
+        let packed_chunk = quantized_blockwise
+            .quantized
+            .clone()
+            .slice([start_block * packed_per_block..end_block * packed_per_block]);
+        let scales_chunk = quantized_blockwise
+            .scales
+            .clone()
+            .slice([start_block..end_block]);
 
-    let v2 = rest2.clone().div_scalar(256);
-    let v3 = rest2.sub(v2.clone().mul_scalar(256));
+        // Unpack
+        let v0 = packed_chunk.clone().div_scalar(16777216);
+        let rest1 = packed_chunk.sub(v0.clone().mul_scalar(16777216));
+        let v1 = rest1.clone().div_scalar(65536);
+        let rest2 = rest1.sub(v1.clone().mul_scalar(65536));
+        let v2 = rest2.clone().div_scalar(256);
+        let v3 = rest2.sub(v2.clone().mul_scalar(256));
 
-    // 2. Reconstruct the flattened unsigned tensor
-    // We use stack to join them back into the original order
-    // let unpacked = Tensor::stack::<D>(vec![v0, v1, v2, v3], 1)
-    //     .reshape([padded_total])
-    //     .sub_scalar(128); // Shift back to [-127, 127]
-    let unpacked = Tensor::stack::<2>(vec![v0, v1, v2, v3], 1) // Force rank 2
-        .reshape([padded_total])
-        .sub_scalar(128);
+        let unpacked = Tensor::stack::<2>(vec![v0, v1, v2, v3], 1)
+            .reshape([current_chunk_blocks * block_size])
+            .sub_scalar(128);
 
-    // 3. Dequantize normally
-    let num_blocks = padded_total / block_size;
-    let quantized_blocked = unpacked.reshape([num_blocks, block_size]);
+        // Dequantize
+        let scales_expanded = scales_chunk
+            .reshape([current_chunk_blocks, 1])
+            .expand([current_chunk_blocks, block_size])
+            .reshape([current_chunk_blocks * block_size]);
 
-    let scales_expanded = quantized_blockwise
-        .scales
-        .reshape([num_blocks, 1])
-        .expand([num_blocks, block_size]);
+        dequantized_chunks.push(unpacked.float().mul(scales_expanded));
+    }
 
-    let dequantized = quantized_blocked.float().mul(scales_expanded);
-
-    dequantized
-        .reshape([padded_total])
+    Tensor::cat(dequantized_chunks, 0)
         .slice([0..total_elements])
         .reshape(shape)
 }
