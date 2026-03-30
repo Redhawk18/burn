@@ -16,6 +16,9 @@ use crate::{LearningRate, grad_clipping::GradientClippingConfig};
 #[allow(unused_imports)]
 use num_traits::Float as _;
 
+/// The amount of values we pack into one index of a ensor.
+const PACKING_AMOUNT: usize = 2;
+
 /// [`AdamW8Bit`] Configuration.
 #[derive(Config, Debug)]
 pub struct AdamWConfig8Bit {
@@ -244,6 +247,8 @@ fn quantize_blockwise<B: Backend, const D: usize>(
     let shape = tensor.shape();
     let total_elements = shape.num_elements();
 
+    // Ensure we can pack by 2; if block_size is odd, this might need adjustment,
+    // but usually block_size is a power of 2.
     let padding = (block_size - (total_elements % block_size)) % block_size;
     let padded_total = total_elements + padding;
     let num_blocks = padded_total / block_size;
@@ -259,19 +264,16 @@ fn quantize_blockwise<B: Backend, const D: usize>(
     let mut packed_chunks = Vec::new();
     let mut scale_chunks = Vec::new();
 
-    // Loop through blocks in chunks
     for start_block in (0..num_blocks).step_by(CHUNK_BLOCKS) {
         let end_block = core::cmp::min(start_block + CHUNK_BLOCKS, num_blocks);
         let current_chunk_blocks = end_block - start_block;
         let elements_in_chunk = current_chunk_blocks * block_size;
 
-        // Slice the input for this chunk
         let chunk_input = input
             .clone()
             .slice([start_block * block_size..end_block * block_size]);
         let blocked = chunk_input.reshape([current_chunk_blocks, block_size]);
 
-        // Calculate scales for this chunk
         let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
         let chunk_scales = abs_max
             .clone()
@@ -283,30 +285,23 @@ fn quantize_blockwise<B: Backend, const D: usize>(
             .reshape([current_chunk_blocks, 1])
             .expand([current_chunk_blocks, block_size]);
 
-        // Quantize and Pack
+        // Quantize to 0-255
         let quantized = blocked.div(scales_expanded).round().int().add_scalar(128);
-        let to_pack = quantized.reshape([elements_in_chunk / 4, 4]);
+
+        // --- 2-to-1 Packing Logic ---
+        // We pack two 8-bit values into the lower 16 bits of an i32.
+        let to_pack = quantized.reshape([elements_in_chunk / PACKING_AMOUNT, PACKING_AMOUNT]);
 
         let v0 = to_pack
             .clone()
-            .slice([0..elements_in_chunk / 4, 0..1])
+            .slice([0..elements_in_chunk / PACKING_AMOUNT, 0..1])
             .squeeze_dims(&[1])
-            .mul_scalar(16777216);
+            .mul_scalar(256); // Shift left by 8 bits
         let v1 = to_pack
-            .clone()
-            .slice([0..elements_in_chunk / 4, 1..2])
-            .squeeze_dims(&[1])
-            .mul_scalar(65536);
-        let v2 = to_pack
-            .clone()
-            .slice([0..elements_in_chunk / 4, 2..3])
-            .squeeze_dims(&[1])
-            .mul_scalar(256);
-        let v3 = to_pack
-            .slice([0..elements_in_chunk / 4, 3..4])
+            .slice([0..elements_in_chunk / PACKING_AMOUNT, 1..2])
             .squeeze_dims(&[1]);
 
-        packed_chunks.push(v0.add(v1).add(v2).add(v3));
+        packed_chunks.push(v0.add(v1));
         scale_chunks.push(chunk_scales);
     }
 
@@ -324,7 +319,7 @@ fn dequantize_blockwise<B: Backend, const D: usize>(
     let shape = Shape::from(quantized_blockwise.shape);
     let total_elements = shape.num_elements();
     let num_blocks = quantized_blockwise.scales.shape().num_elements();
-    let packed_per_block = block_size / 4;
+    let packed_per_block = block_size / PACKING_AMOUNT;
 
     let mut dequantized_chunks = Vec::new();
 
@@ -332,7 +327,6 @@ fn dequantize_blockwise<B: Backend, const D: usize>(
         let end_block = core::cmp::min(start_block + CHUNK_BLOCKS, num_blocks);
         let current_chunk_blocks = end_block - start_block;
 
-        // Slice packed data and scales
         let packed_chunk = quantized_blockwise
             .quantized
             .clone()
@@ -342,19 +336,14 @@ fn dequantize_blockwise<B: Backend, const D: usize>(
             .clone()
             .slice([start_block..end_block]);
 
-        // Unpack
-        let v0 = packed_chunk.clone().div_scalar(16777216);
-        let rest1 = packed_chunk.sub(v0.clone().mul_scalar(16777216));
-        let v1 = rest1.clone().div_scalar(65536);
-        let rest2 = rest1.sub(v1.clone().mul_scalar(65536));
-        let v2 = rest2.clone().div_scalar(256);
-        let v3 = rest2.sub(v2.clone().mul_scalar(256));
+        // --- 2-to-1 Unpacking Logic ---
+        let v0 = packed_chunk.clone().div_scalar(256);
+        let v1 = packed_chunk.sub(v0.clone().mul_scalar(256));
 
-        let unpacked = Tensor::stack::<2>(vec![v0, v1, v2, v3], 1)
+        let unpacked = Tensor::stack::<2>(vec![v0, v1], 1)
             .reshape([current_chunk_blocks * block_size])
             .sub_scalar(128);
 
-        // Dequantize
         let scales_expanded = scales_chunk
             .reshape([current_chunk_blocks, 1])
             .expand([current_chunk_blocks, block_size])
@@ -750,8 +739,12 @@ mod tests {
     }
 
     mod quantization {
+        use crate::{GradientsParams, optim::adamw_8bit::tests::given_linear_layer};
+
         use super::super::*;
+        use crate::TestAutodiffBackend;
         use burn::tensor::{Distribution, Tensor};
+        use burn_core::tensor::TensorData;
         use burn_ndarray::NdArray;
 
         type TestBackend = NdArray<f32>;
@@ -766,7 +759,10 @@ mod tests {
             let quantize = quantize_blockwise(tensor.clone(), block_size);
 
             // Verify internal dimensions
-            assert_eq!(quantize.quantized.shape().num_elements(), 256 / 4); // Packed by 4s.
+            assert_eq!(
+                quantize.quantized.shape().num_elements(),
+                256 / PACKING_AMOUNT
+            ); // Packed by 4s.
             assert_eq!(quantize.scales.shape().num_elements(), 2);
 
             let dequantized: Tensor<TestBackend, 1> = dequantize_blockwise(quantize, block_size);
@@ -828,7 +824,10 @@ mod tests {
 
             let quantize = quantize_blockwise(tensor.clone(), block_size);
 
-            assert_eq!(quantize.quantized.shape().num_elements(), 128 / 4); // Packed by 4s.
+            assert_eq!(
+                quantize.quantized.shape().num_elements(),
+                128 / PACKING_AMOUNT
+            ); // Packed by 4s.
             assert_eq!(quantize.scales.shape().num_elements(), 2);
 
             let dequantized: Tensor<TestBackend, 1> = dequantize_blockwise(quantize, block_size);
@@ -844,7 +843,10 @@ mod tests {
 
             let quantize = quantize_blockwise(tensor.clone(), block_size);
 
-            assert_eq!(quantize.quantized.shape().num_elements(), 128 / 4); // Packed by 4s
+            assert_eq!(
+                quantize.quantized.shape().num_elements(),
+                128 / PACKING_AMOUNT
+            ); // Packed by 4s
             assert_eq!(quantize.scales.shape().num_elements(), 4);
 
             let dequantized: Tensor<TestBackend, 2> = dequantize_blockwise(quantize, block_size);
@@ -889,6 +891,100 @@ mod tests {
                 (low_precision_block - 0.01).abs() > 0.0001,
                 "Block 1 should have lower precision due to outlier"
             );
+        }
+
+        use crate::optim::adamw_8bit::tests::LEARNING_RATE;
+        use crate::optim::base::Optimizer;
+
+        #[test]
+        fn test_adamw_8bit_distribution_shift_nan_check() {
+            let device = Default::default();
+
+            // Corrected TensorData initialization
+            let weight_data = TensorData::ones::<f32, _>([12, 12]);
+            let bias_data = TensorData::ones::<f32, _>([12]);
+
+            let mut linear = given_linear_layer(weight_data, bias_data);
+
+            let mut optimizer = AdamWConfig8Bit::new()
+                .with_epsilon(1e-8)
+                .with_block_size(32)
+                .init();
+
+            // --- PHASE 1: The "Hot" Start (High Energy) ---
+            for _ in 1..=20 {
+                let x = Tensor::<TestAutodiffBackend, 2>::random(
+                    [4, 12],
+                    Distribution::Default,
+                    &device,
+                )
+                .mul_scalar(50.0);
+                let grads = linear.forward(x).backward();
+                let grads = GradientsParams::from_grads(grads, &linear);
+                linear = optimizer.step(LEARNING_RATE, linear, grads);
+            }
+
+            // --- PHASE 2: The "Cold" Convergence (Tiny Gradients) ---
+            for step in 1..=100 {
+                let x = Tensor::<TestAutodiffBackend, 2>::random(
+                    [4, 12],
+                    Distribution::Default,
+                    &device,
+                )
+                .mul_scalar(0.001);
+                let grads = linear.forward(x).backward();
+                let grads = GradientsParams::from_grads(grads, &linear);
+                linear = optimizer.step(LEARNING_RATE, linear, grads);
+
+                // Check finite
+                let weights = linear.weight.val().to_data();
+                for (i, val) in weights.as_slice::<f32>().unwrap().iter().enumerate() {
+                    if !val.is_finite() {
+                        panic!(
+                            "NaN/Inf detected at step {} (index {}). Value: {}",
+                            step, i, val
+                        );
+                    }
+                }
+            }
+
+            println!("Passed stability test without NaNs.");
+        }
+
+        use burn::prelude::ToElement;
+
+        #[test]
+        fn test_packing_overflow_logic() {
+            let device = Default::default();
+
+            // We provide values that will be maxed out to 255
+            let data = TensorData::from([127.0, 127.0]);
+            let tensor = Tensor::<TestBackend, 1>::from_data(data, &device);
+
+            let quantized = quantize_blockwise(tensor, 2);
+
+            let packed_values = quantized.quantized.into_data();
+
+            // USE THE BACKEND'S TYPE: This solves the I64 vs I32 mismatch forever
+            let slice = packed_values
+                .as_slice::<<TestBackend as Backend>::IntElem>()
+                .expect("Should match backend's integer type");
+
+            for &val in slice {
+                // We cast to i64 here just for the assertion comparison
+                let val_i64 = val.to_i64();
+
+                assert!(
+                    val_i64 >= 0,
+                    "Packed value is negative (overflowed sign bit): {}",
+                    val_i64
+                );
+                assert!(
+                    val_i64 <= 65535,
+                    "Value exceeds 16-bit packing range: {}",
+                    val_i64
+                );
+            }
         }
     }
 }
