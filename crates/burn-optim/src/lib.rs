@@ -21,6 +21,8 @@ pub mod grad_clipping;
 #[cfg(feature = "std")]
 pub mod lr_scheduler;
 
+mod quantization;
+
 /// Type alias for the learning rate.
 ///
 /// LearningRate also implements [learning rate scheduler](crate::lr_scheduler::LrScheduler) so it

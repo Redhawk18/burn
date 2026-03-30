@@ -51,9 +51,9 @@ pub struct AdamWConfig {
 /// Configured by [`AdamWConfig`].
 #[derive(Clone)]
 pub struct AdamW {
-    pub momentum: AdaptiveMomentumW,
-    pub weight_decay: f32,
-    pub cautious_weight_decay: bool,
+    momentum: AdaptiveMomentumW,
+    weight_decay: f32,
+    cautious_weight_decay: bool,
 }
 
 /// AdamW state.
@@ -139,11 +139,11 @@ impl AdamWConfig {
 }
 
 #[derive(Clone)]
-pub struct AdaptiveMomentumW {
-    pub beta_1: f32,
-    pub beta_2: f32,
-    pub epsilon: f32,
-    pub amsgrad: bool,
+struct AdaptiveMomentumW {
+    beta_1: f32,
+    beta_2: f32,
+    epsilon: f32,
+    amsgrad: bool,
 }
 
 impl AdaptiveMomentumW {

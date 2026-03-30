@@ -103,13 +103,3 @@ dhat = "0.3.3"
 [package.metadata.docs.rs]
 features = ["doc"]
 rustdoc-args = ["--cfg", "docsrs"]
-
-[[bench]]
-name = "adamw"
-path = "benches/adamw.rs"
-harness = false
-
-[[bench]]
-name = "adamw_8bit"
-path = "benches/adamw_8bit.rs"
-harness = false
