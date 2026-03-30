@@ -60,7 +60,7 @@ pub(crate) fn quantize_blockwise<B: Backend, const D: usize>(
 
         let chunk_input = input
             .clone()
-            .slice([start_block * block_size..end_block * block_size]);
+            .slice(start_block * block_size..end_block * block_size);
         let blocked = chunk_input.reshape([current_chunk_blocks, block_size]);
 
         let abs_max = blocked.clone().abs().max_dim(1).squeeze_dims(&[1]);
@@ -119,11 +119,11 @@ pub(crate) fn dequantize_blockwise<B: Backend, const D: usize>(
         let packed_chunk = quantized_blockwise
             .quantized
             .clone()
-            .slice([start_block * packed_per_block..end_block * packed_per_block]);
+            .slice(start_block * packed_per_block..end_block * packed_per_block);
         let scales_chunk = quantized_blockwise
             .scales
             .clone()
-            .slice([start_block..end_block]);
+            .slice(start_block..end_block);
 
         // --- 2-to-1 Unpacking Logic ---
         let v0 = packed_chunk.clone().div_scalar(256);
@@ -142,7 +142,7 @@ pub(crate) fn dequantize_blockwise<B: Backend, const D: usize>(
     }
 
     Tensor::cat(dequantized_chunks, 0)
-        .slice([0..total_elements])
+        .slice(0..total_elements)
         .reshape(shape)
 }
 
