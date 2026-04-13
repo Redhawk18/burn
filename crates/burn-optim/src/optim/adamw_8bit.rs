@@ -11,7 +11,10 @@ use burn::tensor::{
 use burn::{module::AutodiffModule, record::Record};
 
 use super::{SimpleOptimizer, adaptor::OptimizerAdaptor};
-use crate::quantization::{QuantizeBlockwise, dequantize_blockwise, quantize_blockwise};
+use crate::quantization::{
+    QuantizeBlockwise, dequantize_blockwise, linear, quantize_blockwise, signed_dynamic,
+    unsigned_dynamic,
+};
 use crate::{LearningRate, grad_clipping::GradientClippingConfig};
 
 #[cfg(not(feature = "std"))]
@@ -32,7 +35,7 @@ pub struct AdamWConfig8Bit {
     #[config(default = 256)]
     block_size: usize,
     /// A value required for numerical stability.
-    #[config(default = 1e-3)]
+    #[config(default = 1e-5)]
     epsilon: f32,
     /// Weight decay config.
     #[config(default = 1e-4)]
@@ -110,6 +113,7 @@ impl<B: Backend> SimpleOptimizer<B> for AdamW8Bit {
     fn to_device<const D: usize>(mut state: Self::State<D>, device: &Device<B>) -> Self::State<D> {
         state.moment_1 = state.moment_1.to_device(device);
         state.moment_2 = state.moment_2.to_device(device);
+        state.max_moment_2 = state.max_moment_2.map(|m| m.to_device(device));
         state
     }
 }
@@ -163,10 +167,19 @@ impl AdaptiveMomentumW8Bit {
 
         let (mut m1, mut m2, mut max_v, time) = if let Some(s) = state {
             (
-                dequantize_blockwise::<B, D>(s.moment_1, self.block_size),
-                dequantize_blockwise::<B, D>(s.moment_2, self.block_size),
-                s.max_moment_2
-                    .map(|m| dequantize_blockwise::<B, D>(m, self.block_size)),
+                dequantize_blockwise::<B, D, _>(
+                    s.moment_1,
+                    self.block_size,
+                    signed_dynamic::decode,
+                ),
+                dequantize_blockwise::<B, D, _>(
+                    s.moment_2,
+                    self.block_size,
+                    unsigned_dynamic::decode,
+                ),
+                s.max_moment_2.map(|m| {
+                    dequantize_blockwise::<B, D, _>(m, self.block_size, unsigned_dynamic::decode)
+                }),
                 s.time + 1,
             )
         } else {
@@ -198,14 +211,20 @@ impl AdaptiveMomentumW8Bit {
         // Compute delta.
         let m1_corrected = m1.clone().div_scalar(1f32 - self.beta_1.powi(time as i32));
         let m2_corrected = v_to_use.div_scalar(1f32 - self.beta_2.powi(time as i32));
-        let update_delta = m1_corrected.div(m2_corrected.sqrt().add_scalar(self.epsilon));
+        let update_delta = m1_corrected.div(
+            m2_corrected
+                .clamp_min(1e-16)
+                .sqrt()
+                .add_scalar(self.epsilon),
+        );
 
         // Requantize for storage.
         let state_8bit = AdamWState8Bit {
             time,
-            moment_1: quantize_blockwise(m1.clone(), self.block_size),
-            moment_2: quantize_blockwise(m2, self.block_size),
-            max_moment_2: max_v.map(|m| quantize_blockwise(m, self.block_size)),
+            moment_1: quantize_blockwise(m1.clone(), self.block_size, signed_dynamic::encode),
+            moment_2: quantize_blockwise(m2, self.block_size, unsigned_dynamic::encode),
+            max_moment_2: max_v
+                .map(|m| quantize_blockwise(m, self.block_size, unsigned_dynamic::encode)),
         };
 
         (update_delta, state_8bit, m1)
