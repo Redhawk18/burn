@@ -72,6 +72,7 @@ where
     let quantized = encode(normalized);
 
     // Pack
+    // In the future use the packing kernel in CubeK.
     let flat = quantized.reshape([padded_total / PACKING_AMOUNT, PACKING_AMOUNT]);
     let v0 = flat
         .clone()
@@ -105,6 +106,7 @@ where
     let num_blocks = padded_total / block_size;
 
     // Unpack
+    // In the future use the packing kernel in CubeK.
     let packed = quantized_blockwise.quantized;
     let v0 = packed.clone().div_scalar(256);
     let v1 = packed - v0.clone().mul_scalar(256);

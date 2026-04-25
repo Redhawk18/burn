@@ -12,8 +12,7 @@ use burn::{module::AutodiffModule, record::Record};
 
 use super::{SimpleOptimizer, adaptor::OptimizerAdaptor};
 use crate::quantization::{
-    QuantizeBlockwise, dequantize_blockwise, linear, quantize_blockwise, signed_dynamic,
-    unsigned_dynamic,
+    QuantizeBlockwise, dequantize_blockwise, quantize_blockwise, signed_dynamic, unsigned_dynamic,
 };
 use crate::{LearningRate, grad_clipping::GradientClippingConfig};
 
@@ -209,14 +208,21 @@ impl AdaptiveMomentumW8Bit {
         };
 
         // Compute delta.
-        let m1_corrected = m1.clone().div_scalar(1f32 - self.beta_1.powi(time as i32));
-        let m2_corrected = v_to_use.div_scalar(1f32 - self.beta_2.powi(time as i32));
-        let update_delta = m1_corrected.div(
-            m2_corrected
-                .clamp_min(1e-16)
-                .sqrt()
-                .add_scalar(self.epsilon),
-        );
+        // let m1_corrected = m1.clone().div_scalar(1f32 - self.beta_1.powi(time as i32));
+        // let m2_corrected = v_to_use.div_scalar(1f32 - self.beta_2.powi(time as i32));
+        // let update_delta = m1_corrected.div(
+        //     m2_corrected
+        //         .clamp_min(1e-16)
+        //         .sqrt()
+        //         .add_scalar(self.epsilon),
+        // );
+        let correction1 = 1.0 - self.beta_1.powi(time as i32);
+        let correction2 = (1.0 - self.beta_2.powi(time as i32)).sqrt();
+        let step_size = correction2 / correction1; // absorb lr into caller
+        let update_delta = m1
+            .clone()
+            .div(v_to_use.sqrt().add_scalar(self.epsilon * correction2))
+            .mul_scalar(step_size);
 
         // Requantize for storage.
         let state_8bit = AdamWState8Bit {
@@ -658,5 +664,87 @@ mod tests {
         }
 
         println!("Passed stability test without NaNs.");
+    }
+
+    #[test]
+    fn test_adamw_8bit_zipfian_update_frequency() {
+        use burn::tensor::{Distribution, Shape};
+
+        let device = Default::default();
+        let rows = 1024;
+        let cols = 8;
+        let shape = [rows, cols];
+
+        let momentum = AdaptiveMomentumW8Bit {
+            beta_1: 0.9,
+            beta_2: 0.999,
+            epsilon: 1e-8,
+            amsgrad: false,
+            block_size: 256,
+        };
+
+        let mut param = Tensor::<TestAutodiffBackend, 2>::random(
+            shape,
+            Distribution::Normal(0.0, 0.02),
+            &device,
+        );
+        let mut state: Option<AdamWState8Bit<TestAutodiffBackend, 2>> = None;
+
+        let lr = 0.01_f32;
+        let mut prev_max_abs = 0.0f32;
+
+        for step in 1..=200 {
+            // Build Zipfian gradient as flat data, then reshape to 2D
+            let mut grad_data = vec![0.0f32; rows * cols];
+
+            if step % 17 == 0 {
+                let rare_row = (rows * 3 / 4) + (step % (rows / 4));
+                for c in 0..cols {
+                    grad_data[rare_row * cols + c] = 3.0;
+                }
+            } else {
+                let frequent_count = rows / 20;
+                for r in 0..frequent_count {
+                    for c in 0..cols {
+                        grad_data[r * cols + c] = 0.3;
+                    }
+                }
+            }
+
+            // Build as 1D then reshape to 2D — avoids the from_floats rank inference issue
+            let grad = Tensor::<TestAutodiffBackend, 1>::from_floats(grad_data.as_slice(), &device)
+                .reshape(Shape::from(shape));
+
+            let (delta, new_state, _m1) = momentum.transform(grad, state);
+            param = param - delta.mul_scalar(lr);
+            state = Some(new_state);
+
+            let data = param.clone().to_data();
+            let slice = data.as_slice::<f32>().unwrap();
+
+            for (i, val) in slice.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "Non-finite param at step {}, index {}: {}",
+                    step,
+                    i,
+                    val,
+                );
+            }
+
+            let current_max_abs = slice.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+            if step > 20 {
+                assert!(
+                    current_max_abs < 10.0,
+                    "Param magnitude diverged at step {}: max |p| = {} (prev: {})",
+                    step,
+                    current_max_abs,
+                    prev_max_abs,
+                );
+            }
+
+            prev_max_abs = current_max_abs;
+        }
     }
 }
